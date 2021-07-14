@@ -16,30 +16,28 @@
 
 package org.entando.kubernetes.controller.app;
 
+import static java.lang.String.format;
+
 import io.fabric8.kubernetes.api.model.EnvVar;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Optional;
 import org.entando.kubernetes.controller.spi.container.DatabaseSchemaConnectionInfo;
-import org.entando.kubernetes.controller.spi.container.DbAware;
-import org.entando.kubernetes.controller.spi.container.KeycloakClientConfig;
-import org.entando.kubernetes.controller.spi.container.KeycloakConnectionConfig;
+import org.entando.kubernetes.controller.spi.container.DbAwareContainer;
 import org.entando.kubernetes.controller.spi.container.ParameterizableContainer;
-import org.entando.kubernetes.controller.spi.container.PersistentVolumeAware;
+import org.entando.kubernetes.controller.spi.container.PersistentVolumeAwareContainer;
 import org.entando.kubernetes.controller.spi.container.SecretToMount;
 import org.entando.kubernetes.controller.spi.container.SpringBootDeployableContainer;
-import org.entando.kubernetes.controller.spi.result.DatabaseServiceResult;
-import org.entando.kubernetes.controller.support.client.InfrastructureConfig;
-import org.entando.kubernetes.controller.support.common.KubeUtils;
-import org.entando.kubernetes.controller.support.spibase.KeycloakAwareContainerBase;
-import org.entando.kubernetes.model.DbmsVendor;
-import org.entando.kubernetes.model.KeycloakAwareSpec;
+import org.entando.kubernetes.controller.spi.container.SsoAwareContainer;
+import org.entando.kubernetes.controller.spi.deployable.SsoClientConfig;
+import org.entando.kubernetes.controller.spi.deployable.SsoConnectionInfo;
+import org.entando.kubernetes.controller.spi.result.DatabaseConnectionInfo;
 import org.entando.kubernetes.model.app.EntandoApp;
-import org.entando.kubernetes.model.plugin.Permission;
+import org.entando.kubernetes.model.common.DbmsVendor;
 
 public class ComponentManagerDeployableContainer
-        implements SpringBootDeployableContainer, PersistentVolumeAware, ParameterizableContainer, KeycloakAwareContainerBase {
+        implements SpringBootDeployableContainer, PersistentVolumeAwareContainer, ParameterizableContainer, SsoAwareContainer {
 
     public static final String COMPONENT_MANAGER_QUALIFIER = "de";
     public static final String COMPONENT_MANAGER_IMAGE_NAME = "entando/entando-component-manager";
@@ -47,30 +45,34 @@ public class ComponentManagerDeployableContainer
     private static final String DEDB = "dedb";
     public static final String ECR_GIT_CONFIG_DIR = "/etc/ecr-git-config";
     private final EntandoApp entandoApp;
-    private final KeycloakConnectionConfig keycloakConnectionConfig;
-    private final InfrastructureConfig infrastructureConfig;
-    private final EntandoAppDeploymentResult entandoAppDeployment;
+    private final SsoConnectionInfo keycloakConnectionConfig;
+    private final EntandoK8SService infrastructureConfig;
     private final List<DatabaseSchemaConnectionInfo> databaseSchemaConnectionInfo;
+    private SsoClientConfig ssoClientConfig;
 
     public ComponentManagerDeployableContainer(
             EntandoApp entandoApp,
-            KeycloakConnectionConfig keycloakConnectionConfig,
-            InfrastructureConfig infrastructureConfig,
-            EntandoAppDeploymentResult entandoAppDeployment,
-            DatabaseServiceResult databaseServiceResult) {
+            SsoConnectionInfo keycloakConnectionConfig,
+            EntandoK8SService infrastructureConfig,
+            DatabaseConnectionInfo databaseServiceResult,
+            SsoClientConfig ssoClientConfig) {
         this.entandoApp = entandoApp;
         this.keycloakConnectionConfig = keycloakConnectionConfig;
         this.infrastructureConfig = infrastructureConfig;
-        this.entandoAppDeployment = entandoAppDeployment;
+        this.ssoClientConfig = ssoClientConfig;
         this.databaseSchemaConnectionInfo = Optional.ofNullable(databaseServiceResult)
-                .map(dsr -> DbAware.buildDatabaseSchemaConnectionInfo(entandoApp, dsr, Collections.singletonList(DEDB)))
+                .map(dsr -> DbAwareContainer.buildDatabaseSchemaConnectionInfo(entandoApp, dsr, Collections.singletonList(DEDB)))
                 .orElse(Collections.emptyList());
     }
 
     @Override
+    public Optional<Integer> getMaximumStartupTimeSeconds() {
+        return Optional.of(120);
+    }
+
+    @Override
     public Optional<String> getStorageClass() {
-        return Optional
-                .ofNullable(entandoApp.getSpec().getStorageClass().orElse(PersistentVolumeAware.super.getStorageClass().orElse(null)));
+        return entandoApp.getSpec().getStorageClass().or(PersistentVolumeAwareContainer.super::getStorageClass);
     }
 
     @Override
@@ -91,11 +93,13 @@ public class ComponentManagerDeployableContainer
     @Override
     public List<EnvVar> getEnvironmentVariables() {
         List<EnvVar> vars = new ArrayList<>();
-        String entandoUrl = entandoAppDeployment.getInternalBaseUrl();
+        String entandoUrl = EntandoAppDeployableContainer.determineEntandoServiceBaseUrl(this.entandoApp);
         vars.add(new EnvVar("ENTANDO_APP_NAME", entandoApp.getMetadata().getName(), null));
         vars.add(new EnvVar("ENTANDO_URL", entandoUrl, null));
         vars.add(new EnvVar("SERVER_PORT", String.valueOf(getPrimaryPort()), null));
-        getInfrastructureConfig().ifPresent(c -> vars.add(new EnvVar("ENTANDO_K8S_SERVICE_URL", c.getK8SExternalServiceUrl(), null)));
+        vars.add(
+                new EnvVar("ENTANDO_K8S_SERVICE_URL", format("http://%s:%s/k8s", infrastructureConfig.getInternalServiceHostname(),
+                        infrastructureConfig.getService().getSpec().getPorts().get(0).getPort()), null));
         //The ssh files will be copied to /opt/.ssh and chmod to 400. This can only happen at runtime because Openshift generates a
         // random userid
         entandoApp.getSpec().getEcrGitSshSecretName().ifPresent(s -> vars.add(new EnvVar("GIT_SSH_COMMAND", "ssh "
@@ -108,6 +112,11 @@ public class ComponentManagerDeployableContainer
     @Override
     public Optional<DbmsVendor> getDbms() {
         return Optional.of(entandoApp.getSpec().getDbms().orElse(DbmsVendor.EMBEDDED));
+    }
+
+    @Override
+    public SsoClientConfig getSsoClientConfig() {
+        return ssoClientConfig;
     }
 
     @Override
@@ -137,21 +146,9 @@ public class ComponentManagerDeployableContainer
         return 750;
     }
 
-    public KeycloakConnectionConfig getKeycloakConnectionConfig() {
-        return keycloakConnectionConfig;
-    }
-
     @Override
-    public KeycloakClientConfig getKeycloakClientConfig() {
-        String entandoAppClientId = EntandoAppDeployableContainer.clientIdOf(entandoApp);
-        String clientId = entandoApp.getMetadata().getName() + "-" + getNameQualifier();
-        List<Permission> permissions = new ArrayList<>();
-        permissions.add(new Permission(entandoAppClientId, "superuser"));
-        this.getInfrastructureConfig()
-                .ifPresent(c -> permissions.add(new Permission(c.getK8sServiceClientId(), KubeUtils.ENTANDO_APP_ROLE)));
-        return new KeycloakClientConfig(getKeycloakRealmToUse(), clientId, clientId,
-                Collections.emptyList(),
-                permissions);
+    public SsoConnectionInfo getSsoConnectionInfo() {
+        return keycloakConnectionConfig;
     }
 
     @Override
@@ -169,17 +166,9 @@ public class ComponentManagerDeployableContainer
         return "/entando-data";
     }
 
-    private Optional<InfrastructureConfig> getInfrastructureConfig() {
-        return Optional.ofNullable(infrastructureConfig);
-    }
-
     @Override
     public List<EnvVar> getEnvironmentVariableOverrides() {
         return entandoApp.getSpec().getEnvironmentVariables();
     }
 
-    @Override
-    public KeycloakAwareSpec getKeycloakAwareSpec() {
-        return entandoApp.getSpec();
-    }
 }
